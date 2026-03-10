@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trial-viewer"
+version = "0.1.0"
+description = "Interactive viewer for biomechanics IMU & joint kinetics/kinematics data"
+requires-python = ">=3.10"
+dependencies = [
+    "dash>=2.14",
+    "pandas>=2.0",
+    "plotly>=5.0",
+]
+
+[project.scripts]
+trial-viewer = "trial_viewer.app:main"
