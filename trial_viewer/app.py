@@ -11,18 +11,147 @@ Keyboard shortcuts (when not typing in an input):
 
 import os
 import sys
+import json
+import re
 import pandas as pd
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    import h5py  # type: ignore
+except Exception:  # pragma: no cover
+    h5py = None
+
 
 # ── Trial Discovery ──────────────────────────────────────────────────────────
 
+_SUBJECT_RE = re.compile(r"^S\d{3}$")
+_TRIAL_RE = re.compile(r"^trial_\d+$")
+
+
+def _resolve_h5_pair(root_path: str) -> tuple[str | None, str | None]:
+    """Resolve (filesystem subject root, h5 bundle dir) for paired layouts.
+
+    Supports `.../<Name>/Sxxx/...` next to `.../<Name>_h5/Sxxx.h5` (same parent),
+    e.g. Camargo/Camargo_h5, Scherpereel/Scherpereel_h5, Molinaro_Scherpereel/..., MetaMobility.
+
+    Returns (fs_root, h5_root). If only the *_h5 tree exists, fs_root is None and
+    h5_root points at that directory (h5-only discovery).
+    """
+    root_path = os.path.abspath(root_path)
+    base = os.path.basename(os.path.normpath(root_path))
+    parent = os.path.dirname(os.path.normpath(root_path))
+
+    pairs = (
+        ("Camargo", "Camargo_h5"),
+        ("MetaMobility", "MetaMobility_h5"),
+        ("Scherpereel", "Scherpereel_h5"),
+        ("Molinaro_Scherpereel", "Molinaro_Scherpereel_h5"),
+    )
+    for fs_name, h5_name in pairs:
+        if base == fs_name:
+            h5_root = os.path.join(parent, h5_name)
+            if os.path.isdir(h5_root):
+                return root_path, h5_root
+        elif base == h5_name:
+            h5_root = root_path
+            fs_root = os.path.join(parent, fs_name)
+            if os.path.isdir(fs_root):
+                return fs_root, h5_root
+            return None, h5_root
+    return None, None
+
+
+def _memo_flat_h5_root(root_path: str) -> str | None:
+    """`Processed/MeMo` stores `Sxxx.h5` files in the dataset folder (no MeMo_h5 sibling, no per-subject dirs)."""
+    root_path = os.path.abspath(root_path)
+    if os.path.basename(os.path.normpath(root_path)) != "MeMo":
+        return None
+    if not os.path.isdir(root_path):
+        return None
+    try:
+        names = os.listdir(root_path)
+    except OSError:
+        return None
+    if not any(n.endswith(".h5") and _SUBJECT_RE.match(n[:-3]) for n in names):
+        return None
+    return root_path
+
+
 def discover_trials(root_path):
-    """Walk directory tree and return all trial folders that contain Input/imu_data.csv."""
+    """Discover trials for supported dataset layouts.
+
+    Primary support:
+    - Paired filesystem + HDF5: `.../<Name>/Sxxx/<condition>/trial_YY/...` with sibling
+      `.../<Name>_h5/Sxxx.h5` (angles + moments in h5). Same pattern for Camargo, Scherpereel,
+      Molinaro_Scherpereel, MetaMobility.
+    - HDF5-only: open `.../<Name>_h5` when the filesystem tree is absent, or `.../MeMo` (flat Sxxx.h5).
+    """
     trials = []
+    root_path = os.path.abspath(root_path)
+
+    fs_root, h5_root = _resolve_h5_pair(root_path)
+    if h5_root is None:
+        memo = _memo_flat_h5_root(root_path)
+        if memo is not None:
+            h5_root = memo
+
+    # 1) Discover trials from the filesystem tree; load arrays from sibling *_h5/*.h5.
+    if fs_root and h5_root and os.path.isdir(fs_root):
+        subjects = [d for d in os.listdir(fs_root) if _SUBJECT_RE.match(d)]
+        if subjects:
+            for subj in sorted(subjects):
+                subj_dir = os.path.join(fs_root, subj)
+                for condition in sorted(os.listdir(subj_dir)):
+                    condition_dir = os.path.join(subj_dir, condition)
+                    if not os.path.isdir(condition_dir):
+                        continue
+                    if not os.path.isfile(os.path.join(condition_dir, "condition_meta.json")):
+                        continue
+                    for trial in sorted(os.listdir(condition_dir)):
+                        if not _TRIAL_RE.match(trial):
+                            continue
+                        h5_path = os.path.join(h5_root, f"{subj}.h5")
+                        if not os.path.isfile(h5_path):
+                            continue
+                        trials.append({
+                            "kind": "camargo_h5",
+                            "h5_path": h5_path,
+                            "condition": condition,
+                            "trial": trial,
+                            "label": f"{subj}/{condition}/{trial}",
+                        })
+            if trials:
+                trials.sort(key=lambda t: t["label"])
+                return trials
+
+    # 2) HDF5-only, or explicit *_h5 root: discover by inspecting h5 keys.
+    if h5_root and os.path.abspath(root_path) == os.path.abspath(h5_root):
+        if h5py is None:
+            return []
+        for fname in sorted(os.listdir(h5_root)):
+            if not fname.endswith(".h5"):
+                continue
+            subj = fname[:-3]
+            h5_path = os.path.join(h5_root, fname)
+            with h5py.File(h5_path, "r") as f:
+                for condition in sorted(f.keys()):
+                    for trial in sorted(f[condition].keys()):
+                        if not _TRIAL_RE.match(trial):
+                            continue
+                        trials.append({
+                            "kind": "camargo_h5",
+                            "h5_path": h5_path,
+                            "condition": condition,
+                            "trial": trial,
+                            "label": f"{subj}/{condition}/{trial}",
+                        })
+        trials.sort(key=lambda t: t["label"])
+        return trials
+
+    # 3) Fallback to the older CSV layout (Input/imu_data.csv, Label/joint_*.csv).
     for dirpath, _, _ in os.walk(root_path):
         if os.path.isfile(os.path.join(dirpath, "Input", "imu_data.csv")):
             trials.append({
@@ -38,11 +167,91 @@ def discover_trials(root_path):
 _cache = {"key": None, "data": None}
 
 
-def get_trial_data(trial_path):
-    if _cache["key"] == trial_path:
+def _read_h5_columns(dataset) -> list[str]:
+    # Stored as JSON string in a `columns` attribute, e.g. '["time", "..."]'
+    return json.loads(dataset.attrs["columns"])
+
+
+def get_trial_data(trial_info):
+    cache_key = None
+    if isinstance(trial_info, dict):
+        kind = trial_info.get("kind")
+        if kind == "camargo_h5":
+            cache_key = (kind, trial_info["h5_path"], trial_info["condition"], trial_info["trial"])
+        elif "path" in trial_info:
+            cache_key = ("csv", trial_info["path"])
+    else:
+        cache_key = ("csv", trial_info)
+
+    if _cache["key"] == cache_key:
         return _cache["data"]
 
     data = {}
+
+    if isinstance(trial_info, dict) and trial_info.get("kind") == "camargo_h5":
+        if h5py is None:
+            raise RuntimeError("Missing dependency `h5py`. Install `trial-viewer` with h5py.")
+
+        h5_path = trial_info["h5_path"]
+        condition = trial_info["condition"]
+        trial_name = trial_info["trial"]
+
+        with h5py.File(h5_path, "r") as f:
+            trial_group = f[condition][trial_name]
+
+            # IMU: combine per-sensor datasets into one dataframe.
+            imu_group = trial_group["imu"]
+            time_vec = None
+            imu_data = {}
+            for sensor in sorted(imu_group.keys()):
+                ds = imu_group[sensor]
+                cols = _read_h5_columns(ds)
+                arr = ds[...]
+
+                if "time" in cols:
+                    t = arr[:, cols.index("time")]
+                else:
+                    t = arr[:, 0]
+
+                if time_vec is None:
+                    time_vec = t
+
+                for j, col in enumerate(cols):
+                    if col == "time":
+                        continue
+                    imu_data[col] = arr[:, j]
+
+            if time_vec is None:
+                data["imu"] = pd.DataFrame()
+            else:
+                imu_df = pd.DataFrame(imu_data)
+                imu_df.insert(0, "time", time_vec)
+                data["imu"] = imu_df
+
+            # IK -> angles
+            ik_group = trial_group["ik"]
+            ik_ds = next(iter(ik_group.values()))
+            ik_cols = _read_h5_columns(ik_ds)
+            ik_arr = ik_ds[...]
+            data["angle"] = pd.DataFrame(ik_arr, columns=ik_cols)
+
+            # ID -> moments
+            id_group = trial_group["id"]
+            id_ds = next(iter(id_group.values()))
+            id_cols = _read_h5_columns(id_ds)
+            id_arr = id_ds[...]
+            data["moment"] = pd.DataFrame(id_arr, columns=id_cols)
+
+        _cache["key"] = cache_key
+        _cache["data"] = data
+        return data
+
+    # CSV fallback
+    if isinstance(trial_info, dict):
+        trial_path = trial_info["path"]
+    else:
+        trial_path = trial_info
+
     files = {
         "imu": os.path.join(trial_path, "Input", "imu_data.csv"),
         "moment": os.path.join(trial_path, "Label", "joint_moment.csv"),
@@ -52,7 +261,7 @@ def get_trial_data(trial_path):
         if os.path.isfile(fpath):
             data[key] = pd.read_csv(fpath)
 
-    _cache["key"] = trial_path
+    _cache["key"] = cache_key
     _cache["data"] = data
     return data
 
@@ -73,13 +282,38 @@ def _pretty(name):
 def build_imu_figure(df, sensor_type):
     """Build a multi-row figure for accelerometer or gyroscope data.
     Sensors are auto-detected from column names containing _accel_ or _gyro_."""
-    key = f"_{sensor_type}_"
-    relevant = [c for c in df.columns if key in c]
+    axis_order = {"x": 0, "y": 1, "z": 2}
 
     sensors = {}
-    for col in relevant:
-        sensor, axis = col.split(key)
-        sensors.setdefault(sensor, []).append((axis, col))
+
+    # Camargo_h5 naming:
+    # - accelerometer: `<sensor>_acc_<x|y|z>` (cols like `pelvis_acc_x`)
+    # - gyroscope:     `<sensor>_gyr_<x|y|z>` (cols like `pelvis_gyr_y`)
+    if sensor_type == "accel":
+        camargo_re = re.compile(r"(?P<sensor>.+)_acc_(?P<axis>[xyz])$")
+        for col in df.columns:
+            m = camargo_re.match(col)
+            if not m:
+                continue
+            sensors.setdefault(m.group("sensor"), []).append((m.group("axis"), col))
+    elif sensor_type == "gyro":
+        camargo_re = re.compile(r"(?P<sensor>.+)_gyr_(?P<axis>[xyz])$")
+        for col in df.columns:
+            m = camargo_re.match(col)
+            if not m:
+                continue
+            sensors.setdefault(m.group("sensor"), []).append((m.group("axis"), col))
+
+    # Older CSV naming (keep as fallback)
+    if not sensors:
+        key = f"_{sensor_type}_"
+        relevant = [c for c in df.columns if key in c]
+        for col in relevant:
+            parts = col.split(key)
+            if len(parts) != 2:
+                continue
+            sensor, axis = parts
+            sensors.setdefault(sensor, []).append((axis, col))
 
     if not sensors:
         return _empty_figure("No data available")
@@ -93,7 +327,7 @@ def build_imu_figure(df, sensor_type):
 
     time = df.get("time", df.index)
     for i, sensor in enumerate(names):
-        for axis, col in sorted(sensors[sensor]):
+        for axis, col in sorted(sensors[sensor], key=lambda t: axis_order.get(t[0], 99)):
             fig.add_trace(
                 go.Scattergl(
                     x=time, y=df[col], name=axis.upper(),
@@ -375,7 +609,7 @@ def create_app():
             return html.Div("Select a dataset to begin.",
                             style={"padding": "40px", "color": "#999", "textAlign": "center"})
 
-        data = get_trial_data(trials[idx]["path"])
+        data = get_trial_data(trials[idx])
 
         tab_map = {
             "tab-accel":  ("imu",    lambda d: build_imu_figure(d, "accel")),
