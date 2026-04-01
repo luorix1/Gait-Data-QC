@@ -13,7 +13,9 @@ import os
 import sys
 import json
 import re
+import numpy as np
 import pandas as pd
+from scipy.signal import butter, filtfilt
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update
 import plotly.graph_objects as go
@@ -64,11 +66,13 @@ def _resolve_h5_pair(root_path: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _memo_flat_h5_root(root_path: str) -> str | None:
-    """`Processed/MeMo` stores `Sxxx.h5` files in the dataset folder (no MeMo_h5 sibling, no per-subject dirs)."""
+def _flat_subject_h5_bundle_root(root_path: str) -> str | None:
+    """Dataset folders that only contain ``Sxxx.h5`` files (flat layout), not ``Sxxx/condition/...``.
+
+    Used by MeMo exports (``Processed/MeMo``), variants like ``MeMo_Final``, and any mirror of that
+    layout. Excludes paired layouts such as Camargo (``S003/`` subject directories under the root).
+    """
     root_path = os.path.abspath(root_path)
-    if os.path.basename(os.path.normpath(root_path)) != "MeMo":
-        return None
     if not os.path.isdir(root_path):
         return None
     try:
@@ -77,6 +81,10 @@ def _memo_flat_h5_root(root_path: str) -> str | None:
         return None
     if not any(n.endswith(".h5") and _SUBJECT_RE.match(n[:-3]) for n in names):
         return None
+    # Per-subject filesystem tree → use paired discovery with *_h5, not this branch.
+    for n in names:
+        if _SUBJECT_RE.match(n) and os.path.isdir(os.path.join(root_path, n)):
+            return None
     return root_path
 
 
@@ -87,16 +95,17 @@ def discover_trials(root_path):
     - Paired filesystem + HDF5: `.../<Name>/Sxxx/<condition>/trial_YY/...` with sibling
       `.../<Name>_h5/Sxxx.h5` (angles + moments in h5). Same pattern for Camargo, Scherpereel,
       Molinaro_Scherpereel, MetaMobility.
-    - HDF5-only: open `.../<Name>_h5` when the filesystem tree is absent, or `.../MeMo` (flat Sxxx.h5).
+    - HDF5-only: open `.../<Name>_h5` when the filesystem tree is absent, or any flat `Sxxx.h5`
+      bundle folder (e.g. ``MeMo``, ``MeMo_Final``).
     """
     trials = []
     root_path = os.path.abspath(root_path)
 
     fs_root, h5_root = _resolve_h5_pair(root_path)
     if h5_root is None:
-        memo = _memo_flat_h5_root(root_path)
-        if memo is not None:
-            h5_root = memo
+        flat_h5 = _flat_subject_h5_bundle_root(root_path)
+        if flat_h5 is not None:
+            h5_root = flat_h5
 
     # 1) Discover trials from the filesystem tree; load arrays from sibling *_h5/*.h5.
     if fs_root and h5_root and os.path.isdir(fs_root):
@@ -264,6 +273,112 @@ def get_trial_data(trial_info):
     _cache["key"] = cache_key
     _cache["data"] = data
     return data
+
+
+# ── Display: zero-phase lowpass (view-only) ──────────────────────────────────
+
+DISPLAY_LOWPASS_CUTOFF_HZ = 4.0
+_LOWPASS_ORDER = 4
+
+
+def _median_sample_rate_hz(time_arr: np.ndarray) -> float | None:
+    t = np.asarray(time_arr, dtype=float)
+    t = t[np.isfinite(t)]
+    if t.size < 2:
+        return None
+    d = np.diff(t)
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return None
+    med = float(np.median(np.abs(d)))
+    if med <= 0:
+        return None
+    return 1.0 / med
+
+
+def _infer_fs_for_dataframe(df: pd.DataFrame, fs_fallback: float | None) -> float | None:
+    if "time" in df.columns:
+        fs = _median_sample_rate_hz(df["time"].to_numpy())
+        if fs is not None and fs > 0:
+            return fs
+    if fs_fallback is not None:
+        return fs_fallback
+    return None
+
+
+def _zero_phase_lowpass_1d(y: np.ndarray, fs: float, cutoff_hz: float, order: int) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    if y.size == 0 or not np.isfinite(fs) or fs <= 0:
+        return y
+    nyq = 0.5 * fs
+    if cutoff_hz <= 0 or cutoff_hz >= nyq:
+        return y
+    wn = cutoff_hz / nyq
+    b, a = butter(order, wn, btype="low")
+    padlen = 3 * max(len(a), len(b))
+    if y.size <= padlen:
+        return y
+    mask = np.isfinite(y)
+    if not mask.any():
+        return y
+    y_work = y.copy()
+    if not mask.all():
+        s = pd.Series(y_work)
+        y_work = (
+            s.interpolate(method="linear", limit_direction="both")
+            .bfill()
+            .ffill()
+            .to_numpy(dtype=float)
+        )
+    try:
+        y_f = filtfilt(b, a, y_work, method="pad")
+    except ValueError:
+        return y
+    out = np.asarray(y_f, dtype=float)
+    out[~mask] = np.nan
+    return out
+
+
+def _filter_numeric_columns_except_time(df: pd.DataFrame, fs: float | None) -> pd.DataFrame:
+    if fs is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        if col == "time":
+            continue
+        if not pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        out[col] = _zero_phase_lowpass_1d(
+            out[col].to_numpy(dtype=float, copy=True),
+            fs,
+            DISPLAY_LOWPASS_CUTOFF_HZ,
+            _LOWPASS_ORDER,
+        )
+    return out
+
+
+def prepare_trial_data_for_display(data: dict) -> dict:
+    """Apply the same 4 Hz zero-phase lowpass to every numeric column (time unchanged).
+
+    Sample rate is taken from each table's ``time`` column when present; if a table has no
+    ``time`` but its row count matches IMU, IMU's rate is used.
+    """
+    imu = data.get("imu")
+    fs_imu: float | None = None
+    imu_len = 0
+    if imu is not None and not imu.empty and "time" in imu.columns:
+        fs_imu = _median_sample_rate_hz(imu["time"].to_numpy())
+        imu_len = len(imu)
+
+    out: dict = {}
+    for key, df in data.items():
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            out[key] = df
+            continue
+        fs_fb = fs_imu if imu_len and len(df) == imu_len else None
+        fs = _infer_fs_for_dataframe(df, fs_fb)
+        out[key] = _filter_numeric_columns_except_time(df, fs)
+    return out
 
 
 # ── Plot Builders ─────────────────────────────────────────────────────────────
@@ -609,7 +724,7 @@ def create_app():
             return html.Div("Select a dataset to begin.",
                             style={"padding": "40px", "color": "#999", "textAlign": "center"})
 
-        data = get_trial_data(trials[idx])
+        data = prepare_trial_data_for_display(get_trial_data(trials[idx]))
 
         tab_map = {
             "tab-accel":  ("imu",    lambda d: build_imu_figure(d, "accel")),
